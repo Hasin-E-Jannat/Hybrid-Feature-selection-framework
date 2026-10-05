@@ -1,0 +1,268 @@
+clc;
+clear all;
+close all;
+I_struct = load('Salinas.mat');
+label_struct = load('SalinasA_gt.mat');
+whos('-file', 'SalinasA_gt.mat')
+
+% Extract actual numeric matrices (field names may vary — adjust accordingly)
+I = I_struct.salinasA;   
+labels = label_struct.salinasA_gt;
+
+
+[r, c, b]=size(I);
+m=r*c;
+
+reshapeI=reshape(I,r*c, b);
+
+%figure(1),plot(reshapeI(:,1), reshapeI(:,2),'.');
+corln=corr(reshapeI);
+
+meanI = mean(reshapeI);
+adjusted = bsxfun(@minus,double(reshapeI),meanI);
+%figure(3),plot(adjusted(:,1), adjusted(:,2),'.');
+%[COEFF SCORE LATENT] = princomp(adjusted);
+%variance=cumsum(var(SCORE)) / sum(var(SCORE))
+
+CV=cov(adjusted);
+
+
+subplot(3,3,2)
+colormap(gray), imagesc(corln(:,:));
+title('Correlation');
+
+[eigVector,eigValue]=eig(CV,'nobalance');
+[eigValue,idx] = sort(diag(eigValue));
+
+eigValue = eigValue(end:-1:1);
+
+eigVector = eigVector(:,idx(end:-1:1));
+
+POV=(eigValue*100)/sum(eigValue);
+subplot(3,3,3)
+bar(log(POV),log(eigValue));
+xlabel('Parcentage of variance');
+ylabel('log(Eigen value)');
+
+
+subplot(3,3,4)
+plot(log(idx),log(eigValue),'.');
+xlabel('index');
+ylabel('log(Eigen value)');
+title('LEV graph');
+
+
+cmeig = (cumsum(eigValue)*100)/(sum(eigValue));
+subplot(3,3,5)
+plot(log(idx),log(cmeig),'.');
+xlabel('PC');
+ylabel('cumulative variance(%)');
+title('Cumulative variance explained');
+
+
+prefinal= eigVector'*adjusted';
+final=prefinal';
+Ipca = bsxfun(@plus,meanI,final);
+
+Ipca_norm=zeros(m,b);
+for i=1:103
+    Ipca_norm(:,i)=((Ipca(:,i)-min(Ipca(:,i)))/(max(Ipca(:,i))-(min(Ipca(:,i))))*255);
+end
+
+
+Ipca_norm=uint8(Ipca_norm);
+Ipca_norm=reshape(Ipca_norm, r, c, b);
+%%
+% Parameters
+data = Ipca_norm;
+patchSize = 9;         % Size of the spatial patch (9x9)
+numBands = 10;        % Number of spectral bands to use
+[dataHeight, dataWidth, numTotalBands] = size(data);
+
+% Select Spectral Bands
+if numBands > numTotalBands
+    error('Number of spectral bands requested exceeds available bands.');
+end
+data = double(data(:, :, 1:numBands)); % Use the first 100 bands
+
+% Normalize Data
+data = data / max(data(:)); % Normalize to [0, 1]
+
+% Padding for Border Pixels
+padSize = floor(patchSize / 2);
+paddedData = padarray(data, [padSize, padSize], 'symmetric');
+paddedLabels = padarray(labels, [padSize, padSize], 0); % Pad with label 0 (unlabeled)
+
+% Extract Patches and Corresponding Labels
+patches = [];
+patchLabels = [];
+for i = 1:dataHeight
+    for j = 1:dataWidth
+        % Extract patch centered at (i, j)
+        patch = paddedData(i:i+patchSize-1, j:j+patchSize-1, :);
+        label = paddedLabels(i+padSize, j+padSize); % Center pixel label
+        
+        % Include only labeled samples
+        if label > 0
+            patches = cat(4, patches, patch); % Add patch to dataset
+            patchLabels = [patchLabels; label]; % Add corresponding label
+        end
+    end
+end
+
+% Convert Labels to Categorical
+patchLabels = categorical(patchLabels);
+
+% Split Data into Training and Validation Sets
+trainRatio = 0.8; % 80% training, 20% validation
+numSamples = numel(patchLabels);
+indices = randperm(numSamples);
+
+numTrain = round(trainRatio * numSamples);
+trainIndices = indices(1:numTrain);
+valIndices = indices(numTrain+1:end);
+
+trainData = patches(:, :, :, trainIndices);
+trainLabels = patchLabels(trainIndices);
+
+valData = patches(:, :, :, valIndices);
+valLabels = patchLabels(valIndices);
+
+% Display Data Sizes
+fprintf('Training Data: %d samples\n', size(trainData, 4));
+fprintf('Validation Data: %d samples\n', size(valData, 4));
+%%
+
+inputSize = 9;
+numClasses = 6;
+% Define and Train the Network
+lgraph = defineResDenseNet(inputSize, numClasses);
+
+
+learningRate = 0.001;
+numEpisodes = 100;
+options = trainingOptions('adam', ...
+    'InitialLearnRate', learningRate, ...
+    'MaxEpochs', numEpisodes, ...
+    'MiniBatchSize', 32, ...
+    'Verbose', true, ...
+    'Plots', 'training-progress');
+
+% Train the Network
+tic; % Start timer
+net = trainNetwork(trainData, categorical(trainLabels), lgraph, options);
+trainingTime = toc; % End timer and store time
+fprintf('Training Time: %.2f seconds\n', trainingTime);
+disp('Training Complete');
+
+tic; % Start timer
+predictedLabels = classify(net, valData);
+accuracy = sum(predictedLabels == valLabels) / numel(valLabels);
+inferenceTime = toc / numSamples; % Time per sample
+fprintf('Average Inference Time per Sample: %.6f seconds\n', inferenceTime);
+fprintf('Validation Accuracy: %.2f%%\n', accuracy * 100);%% Performance measure
+% Compute confusion matrix
+confMat = confusionmat(valLabels, predictedLabels);
+% Customize Confusion Matrix Visualization
+figure;
+cm = confusionchart(confMat, 'RowSummary', 'row-normalized', 'ColumnSummary', 'column-normalized');
+cm.Title = 'Normalized Confusion Matrix';
+cm.FontSize = 12;
+
+% Display Confusion Matrix as Image (Heatmap)
+figure;
+confusionchart(confMat);
+title('Confusion Matrix Heatmap');
+
+
+% Accuracy
+correct_predictions = sum(diag(confMat));
+total_samples = sum(confMat, 'all');
+accuracy = (correct_predictions / total_samples) * 100;
+disp(['Accuracy: ', num2str(accuracy), '%']);
+
+% Precision, Recall, and F1-Score
+num_classes = size(confMat, 1);
+precision = zeros(1, num_classes);
+recall = zeros(1, num_classes);
+f1_score = zeros(1, num_classes);
+
+for i = 1:num_classes
+    TP = confMat(i, i);
+    FP = sum(confMat(:, i)) - TP;
+    FN = sum(confMat(i, :)) - TP;
+    
+    precision(i) = TP / (TP + FP + eps);
+    recall(i) = TP / (TP + FN + eps);
+    f1_score(i) = 2 * (precision(i) * recall(i)) / (precision(i) + recall(i) + eps);
+end
+
+disp('Precision for each class:');
+disp(precision);
+disp('Recall for each class:');
+disp(recall);
+disp('F1-Score for each class:');
+disp(f1_score);
+
+% Kappa Coefficient
+row_sums = sum(confMat, 2);
+col_sums = sum(confMat, 1);
+expected = (row_sums * col_sums) / total_samples;
+
+p_o = accuracy / 100;
+p_e = sum(diag(expected)) / total_samples;
+kappa = (p_o - p_e) / (1 - p_e);
+disp(['Cohen''s Kappa Coefficient: ', num2str(kappa)]);
+
+
+
+
+%%
+% Local Function Definitions
+function lgraph = defineResDenseNet(inputSize, numClasses)
+    % Define ResDenseNet Feature Extractor
+    inputLayer = imageInputLayer([inputSize, inputSize, 10], 'Name', 'input', 'Normalization', 'none'); % For Indian Pines
+    resBlock = [
+        convolution2dLayer(3, 8, 'Padding', 'same', 'Name', 'conv1')
+        batchNormalizationLayer('Name', 'bn1')
+        dlhdl.layer.mishLayer("mish1")
+        convolution2dLayer(3, 16, 'Padding', 'same', 'Name', 'conv2')
+        batchNormalizationLayer('Name', 'bn2')
+    ];
+
+    denseBlock = [
+        convolution2dLayer(3, 32, 'Padding', 'same', 'Name', 'denseConv')
+        batchNormalizationLayer('Name', 'bnDense')
+       dlhdl.layer.mishLayer("mishDense")
+    ];
+
+    poolLayer = globalAveragePooling2dLayer('Name', 'globalPool');
+
+    fcLayers = [
+        fullyConnectedLayer(1024, 'Name', 'fc1')
+        reluLayer('Name', 'relu1')
+        fullyConnectedLayer(1024, 'Name', 'fc2')
+        reluLayer('Name', 'relu2')
+        fullyConnectedLayer(numClasses, 'Name', 'fcOut')
+        softmaxLayer('Name', 'softmax')
+        classificationLayer('Name', 'output')
+    ];
+
+    % Build the Layer Graph
+    lgraph = layerGraph(inputLayer);
+    lgraph = addLayers(lgraph, resBlock);
+    lgraph = addLayers(lgraph, denseBlock);
+    lgraph = addLayers(lgraph, poolLayer);
+    lgraph = addLayers(lgraph, fcLayers);
+
+    % Connect Layers
+    lgraph = connectLayers(lgraph, 'input', 'conv1');
+    lgraph = connectLayers(lgraph, 'bn2', 'denseConv');
+    lgraph = connectLayers(lgraph,'mishDense' ,'globalPool');
+    lgraph = connectLayers(lgraph, 'globalPool', 'fc1');
+    connections = lgraph.Connections
+
+% Plot the Layer Graph
+plot(lgraph);
+analyzeNetwork(lgraph)
+end
